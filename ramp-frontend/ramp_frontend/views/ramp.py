@@ -1,10 +1,12 @@
-import codecs
 import datetime
 import difflib
 import logging
+import io
 import os
 import shutil
 import tempfile
+import time
+import zipfile
 
 from bokeh.embed import components
 
@@ -16,12 +18,14 @@ from flask import redirect
 from flask import render_template
 from flask import request
 from flask import send_from_directory
+from flask import send_file
 
 from wtforms import StringField
 from wtforms.widgets import TextArea
 
 from werkzeug.utils import secure_filename
 
+from ramp_database.model import Event
 from ramp_database.model import Problem
 from ramp_database.model import Submission
 from ramp_database.model import SubmissionFile
@@ -39,6 +43,8 @@ from ramp_database.tools.frontend import is_admin
 from ramp_database.tools.frontend import is_accessible_code
 from ramp_database.tools.frontend import is_accessible_event
 from ramp_database.tools.frontend import is_user_signed_up
+from ramp_database.tools.frontend import is_user_sign_up_requested
+from ramp_database.tools.leaderboard import update_leaderboards
 from ramp_database.tools.submission import add_submission
 from ramp_database.tools.submission import add_submission_similarity
 from ramp_database.tools.submission import get_source_submissions
@@ -80,10 +86,37 @@ def problems():
         add_user_interaction(
             db.session, interaction='looking at problems', user=user
         )
+    problems = get_problem(db.session, None)
+
+    for problem in problems:
+        for event in problem.events:
+            # check the state of the event
+            now = datetime.datetime.now()
+            start = event.opening_timestamp
+            start_collab = event.public_opening_timestamp
+            end = event.closing_timestamp
+            if now < start or now >= end:
+                event.state = 'close'
+            elif now >= start and now < start_collab:
+                event.state = 'competitive'
+            elif now >= start and now >= start_collab and now < end:
+                event.state = 'collab'
+            if user:
+                signed = get_event_team_by_name(
+                                    db.session, event.name,
+                                    flask_login.current_user.name)
+                if not signed:
+                    event.state_user = 'not_signed'
+                elif signed.approved:
+                    event.state_user = 'signed'
+                elif signed:
+                    event.state_user = 'waiting'
+            else:
+                event.state_user = 'not_signed'
 
     # problems = Problem.query.order_by(Problem.id.desc())
     return render_template('problems.html',
-                           problems=get_problem(db.session, None),
+                           problems=problems,
                            admin=admin)
 
 
@@ -118,13 +151,47 @@ def problem(problem_name):
             current_problem.path_ramp_kit,
             '{}_starting_kit.html'.format(current_problem.name)
         )
-        with codecs.open(description_f_name, 'r', 'utf-8') as description_file:
-            description = description_file.read()
-        return render_template('problem.html', problem=current_problem,
-                               description=description, admin=admin)
+        # check which event ramp-kit archive is the latest
+        archive_dir = os.path.join(
+            current_problem.path_ramp_kit, "events_archived"
+        )
+        latest_event_zip = max(
+            [f for f in os.scandir(archive_dir) if f.name.endswith(".zip")],
+            key=lambda x: x.stat().st_mtime
+        )
+        latest_event = os.path.splitext(latest_event_zip.name)[0]
+
+        return render_template(
+            'problem.html', problem=current_problem, admin=admin,
+            notebook_filename=description_f_name, latest_event=latest_event
+        )
     else:
         return redirect_to_user('Problem {} does not exist'
                                 .format(problem_name), is_error=True)
+
+
+@mod.route("/download_starting_kit/<event_name>")
+def download_starting_kit(event_name):
+    event = db.session.query(Event).filter_by(name=event_name).one()
+    return send_from_directory(
+        os.path.join(event.problem.path_ramp_kit, "events_archived"),
+        event_name + ".zip"
+    )
+
+
+@mod.route("/notebook/<problem_name>")
+def notebook(problem_name):
+    current_problem = get_problem(db.session, problem_name)
+    return send_from_directory(
+        current_problem.path_ramp_kit,
+        '{}_starting_kit.html'.format(current_problem.name)
+    )
+
+
+@mod.route("/rules/<event_name>")
+def rules(event_name):
+    event = get_event(db.session, event_name)
+    return render_template('rules.html', event=event)
 
 
 @mod.route("/events/<event_name>")
@@ -151,19 +218,14 @@ def user_event(event_name):
         if app.config['TRACK_USER_INTERACTION']:
             add_user_interaction(db.session, interaction='looking at event',
                                  event=event, user=flask_login.current_user)
-        description_f_name = os.path.join(
-            event.problem.path_ramp_kit,
-            '{}_starting_kit.html'.format(event.problem.name)
-        )
-        with codecs.open(description_f_name, 'r', 'utf-8') as description_file:
-            description = description_file.read()
         admin = is_admin(db.session, event_name, flask_login.current_user.name)
         approved = is_user_signed_up(
             db.session, event_name, flask_login.current_user.name
         )
-        asked = approved
+        asked = is_user_sign_up_requested(
+            db.session, event_name, flask_login.current_user.name
+        )
         return render_template('event.html',
-                               description=description,
                                event=event,
                                admin=admin,
                                approved=approved,
@@ -206,7 +268,7 @@ def sign_up_for_event(event_name):
                            ))
             body += ('Click on this link to approve the sign-up request: {}'
                      .format(url_approve))
-            send_mail(admin, subject, body)
+            send_mail(admin.email, subject, body)
         return redirect_to_user("Sign-up request is sent to event admins.",
                                 is_error=False, category='Request sent')
     sign_up_team(db.session, event.name, flask_login.current_user.name)
@@ -289,6 +351,25 @@ def sandbox(event_name):
     )
     upload_form = UploadForm(prefix='upload')
 
+    #  check if the event is before, during or after open state
+    now = datetime.datetime.now()
+    start = event.opening_timestamp
+    end = event.closing_timestamp
+
+    event_status = {"msg": "",
+                    "state": "not_yet"}
+    start_str = start.strftime("%d of %B %Y at %H:%M")
+    end_str = end.strftime("%d of %B %Y, %H:%M")
+    if now < start:
+        event_status["msg"] = "Event submissions will open on the " + start_str
+        event_status["state"] = "close"
+    elif now < end:
+        event_status["msg"] = "Event submissions are open until " + end_str
+        event_status["state"] = "open"
+    else:  # now >= end
+        event_status["msg"] = "This event closed on the " + end_str
+        event_status["state"] = "close"
+
     admin = is_admin(db.session, event_name, flask_login.current_user.name)
     if request.method == 'GET':
         return render_template(
@@ -297,7 +378,8 @@ def sandbox(event_name):
             code_form=code_form,
             submit_form=submit_form, upload_form=upload_form,
             event=event,
-            admin=admin
+            admin=admin,
+            event_status=event_status
         )
 
     if request.method == 'POST':
@@ -325,12 +407,15 @@ def sandbox(event_name):
                             )
             except Exception as e:
                 return redirect_to_sandbox(event, 'Error: {}'.format(e))
-            return redirect_to_sandbox(
-                event,
-                'You submission has been saved. You can safely comeback to '
-                'your sandbox later.',
-                is_error=False, category='File saved'
-            )
+
+            # if we required to only save the file, redirect now
+            if "saving" in request.form:
+                return redirect_to_sandbox(
+                    event,
+                    'Your submission has been saved. You can safely comeback '
+                    'to your sandbox later.',
+                    is_error=False, category='File saved'
+                )
 
         elif request.files:
             upload_f_name = secure_filename(
@@ -407,8 +492,12 @@ def sandbox(event_name):
             # ie: now we let upload eg external_data.bla, and only fail at
             # submission, without giving a message
 
-        elif ('submit-csrf_token' in request.form and
-              submit_form.validate_on_submit()):
+        if 'submission' in request.form:
+            if not submit_form.validate_on_submit():
+                return redirect_to_sandbox(
+                    event,
+                    'Submission name should not contain any spaces'
+                )
             new_submission_name = request.form['submit-submission_name']
             if not 4 < len(new_submission_name) < 20:
                 return redirect_to_sandbox(
@@ -431,6 +520,7 @@ def sandbox(event_name):
                     'Submission {} already exists. Please change the name.'
                     .format(new_submission_name)
                 )
+
             except MissingExtensionError:
                 return redirect_to_sandbox(
                     event, 'Missing extension'
@@ -455,7 +545,7 @@ def sandbox(event_name):
                     """.format(event_team.event.name,
                                flask_login.current_user.name,
                                new_submission.name, new_submission.path)
-                    send_mail(admin, subject, body)
+                    send_mail(admin.email, subject, body)
             if app.config['TRACK_USER_INTERACTION']:
                 add_user_interaction(
                     db.session,
@@ -480,7 +570,8 @@ def sandbox(event_name):
         code_form=code_form,
         submit_form=submit_form, upload_form=upload_form,
         event=event,
-        admin=admin
+        admin=admin,
+        event_status=event_status
     )
 
 
@@ -523,7 +614,7 @@ def ask_for_event(problem_name):
                 form.opening_date.data,
                 form.closing_date.data
             )
-            send_mail(admin, subject, body)
+            send_mail(admin.email, subject, body)
         return redirect_to_user(
             'Thank you. Your request has been sent to RAMP administrators.',
             category='Event request', is_error=False
@@ -546,7 +637,7 @@ def credit(submission_hash):
                                   .one_or_none())
     access_code = is_accessible_code(
         db.session, submission.event_team.event.name,
-        flask_login.current_user.name, submission.name
+        flask_login.current_user.name, submission.id
     )
     if submission is None or not access_code:
         error_str = 'Missing submission: {}'.format(submission_hash)
@@ -705,7 +796,7 @@ def view_model(submission_hash, f_name):
     if (submission is None or
             not is_accessible_code(db.session, submission.event.name,
                                    flask_login.current_user.name,
-                                   submission.name)):
+                                   submission.id)):
         error_str = 'Missing submission: {}'.format(submission_hash)
         return redirect_to_user(error_str)
     event = submission.event_team.event
@@ -793,14 +884,15 @@ def view_model(submission_hash, f_name):
                         submission, filename)
             )
 
+            workflow_element = WorkflowElement.query.filter_by(
+                name=filename.split('.')[0], workflow=event.workflow).one()
+
             # TODO: deal with different extensions of the same file
             src = os.path.join(submission.path, filename)
             dst = os.path.join(sandbox_submission.path, filename)
             shutil.copy2(src, dst)  # copying also metadata
             logger.info('Copying {} to {}'.format(src, dst))
 
-            workflow_element = WorkflowElement.query.filter_by(
-                name=filename.split('.')[0], workflow=event.workflow).one()
             submission_file = SubmissionFile.query.filter_by(
                 submission=submission,
                 workflow_element=workflow_element).one()
@@ -866,4 +958,75 @@ def view_submission_error(submission_hash):
 
     return render_template(
         'submission_error.html', submission=submission, team=team, event=event
+    )
+
+
+@mod.route("/toggle_competition/<submission_hash>")
+@flask_login.login_required
+def toggle_competition(submission_hash):
+    """Pulling out or putting a submission back into competition.
+
+    Parameters
+    ----------
+    submission_hash : str
+        The submission hash of the current submission.
+    """
+    submission = (Submission.query.filter_by(hash_=submission_hash)
+                                  .one_or_none())
+    if submission is None:
+        error_str = 'Missing submission: {}'.format(submission_hash)
+        return redirect_to_user(error_str)
+
+    access_code = is_accessible_code(
+        db.session, submission.event_team.event.name,
+        flask_login.current_user.name, submission.id
+    )
+    if not access_code:
+        error_str = 'Missing submission: {}'.format(submission_hash)
+        return redirect_to_user(error_str)
+
+    submission.is_in_competition = not submission.is_in_competition
+    db.session.commit()
+    update_leaderboards(db.session, submission.event_team.event.name)
+    return redirect(
+        '/{}/{}'.format(submission_hash, submission.files[0].f_name)
+    )
+
+
+@mod.route("/download/<submission_hash>")
+@flask_login.login_required
+def download_submission(submission_hash):
+    """Download a submission from the server.
+
+    Parameters
+    ----------
+    submission_hash : str
+        The submission hash of the current submission.
+    """
+    submission = (Submission.query.filter_by(hash_=submission_hash)
+                                  .one_or_none())
+    if submission is None:
+        error_str = 'Missing submission: {}'.format(submission_hash)
+        return redirect_to_user(error_str)
+
+    access_code = is_accessible_code(
+        db.session, submission.event_team.event.name,
+        flask_login.current_user.name, submission.id
+    )
+    if not access_code:
+        error_str = 'Unauthorized access: {}'.format(submission_hash)
+        return redirect_to_user(error_str)
+
+    file_in_memory = io.BytesIO()
+    with zipfile.ZipFile(file_in_memory, 'w') as zf:
+        for ff in submission.files:
+            data = zipfile.ZipInfo(ff.f_name)
+            data.date_time = time.localtime(time.time())[:6]
+            data.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(data, ff.get_code())
+    file_in_memory.seek(0)
+    return send_file(
+        file_in_memory,
+        attachment_filename=f"submission_{submission.id}.zip",
+        as_attachment=True,
     )

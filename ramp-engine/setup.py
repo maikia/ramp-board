@@ -31,10 +31,16 @@ CLASSIFIERS = ['Intended Audience :: Science/Research',
                'Operating System :: MacOS',
                'Programming Language :: Python :: 3.6',
                'Programming Language :: Python :: 3.7']
-INSTALL_REQUIRES = ['click', 'numpy', 'psycopg2', 'sqlalchemy']
+INSTALL_REQUIRES = ['click', 'numpy', 'psycopg2-binary', 'sqlalchemy']
 EXTRAS_REQUIRE = {
     'tests': ['pytest', 'pytest-cov'],
     'docs': ['sphinx', 'sphinx_rtd_theme', 'numpydoc']
+}
+PACKAGE_DATA = {
+    'ramp_engine': [
+        os.path.join('tests', 'events', 'iris_test', 'config.yml'),
+        os.path.join('tests', 'events', 'boston_housing', 'config.yml')
+    ]
 }
 
 setup(
@@ -50,6 +56,7 @@ setup(
     zip_safe=False,  # the package can run out of an .egg file
     classifiers=CLASSIFIERS,
     packages=find_packages(),
+    package_data=PACKAGE_DATA,
     install_requires=INSTALL_REQUIRES,
     extras_require=EXTRAS_REQUIRE,
     entry_points={

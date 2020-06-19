@@ -396,12 +396,19 @@ class Submission(Model):
             The state of the new submission.
         """
         self.state = state
+
+        if state == "sent_to_training":
+            self.sent_to_training_timestamp = datetime.datetime.utcnow()
+        elif state == "training":
+            self.training_timestamp = datetime.datetime.utcnow()
+
         if session is None:
             all_cv_folds = self.on_cv_folds
         else:
             all_cv_folds = (session.query(SubmissionOnCVFold)
                                    .filter_by(submission_id=self.id)
                                    .all())
+            all_cv_folds = sorted(all_cv_folds, key=lambda x: x.id)
         for submission_on_cv_fold in all_cv_folds:
             submission_on_cv_fold.state = state
 
@@ -443,6 +450,7 @@ class Submission(Model):
             all_cv_folds = (session.query(SubmissionOnCVFold)
                                    .filter_by(submission_id=self.id)
                                    .all())
+            all_cv_folds = sorted(all_cv_folds, key=lambda x: x.id)
         for submission_on_cv_fold in all_cv_folds:
             submission_on_cv_fold.set_error(error, error_msg)
 
@@ -464,6 +472,7 @@ class Submission(Model):
                 all_cv_folds = (session.query(SubmissionOnCVFold)
                                        .filter_by(submission_id=self.id)
                                        .all())
+                all_cv_folds = sorted(all_cv_folds, key=lambda x: x.id)
             unit_contributivity = 1. / len(all_cv_folds)
             for submission_on_cv_fold in all_cv_folds:
                 self.contributivity += (unit_contributivity *
@@ -480,6 +489,7 @@ class Submission(Model):
             all_cv_folds = (session.query(SubmissionOnCVFold)
                                    .filter_by(submission_id=self.id)
                                    .all())
+            all_cv_folds = sorted(all_cv_folds, key=lambda x: x.id)
         states = [submission_on_cv_fold.state
                   for submission_on_cv_fold in all_cv_folds]
         if all(state == 'tested' for state in states):
@@ -629,7 +639,8 @@ class SubmissionFile(Model):
 
     @property
     def is_editable(self):
-        """bool: Whether the submission file is from an editable format."""
+        """bool: Whether the submission file is from an editable format on the
+        frontend."""
         return self.workflow_element.is_editable
 
     @property
@@ -682,7 +693,6 @@ class SubmissionFile(Model):
         code : str
             The code to write into the submission file.
         """
-        code.encode('ascii')  # to raise an exception if code is not ascii
         with open(self.path, 'w') as f:
             f.write(code)
 
@@ -744,7 +754,7 @@ class SubmissionFileType(Model):
     name : str
         The name of the submission file type.
     is_editable : bool
-        Whether or not this type of file is editable.
+        Whether or not this type of file is editable on the frontend.
     max_size : int
         The maximum size of this file type.
     workflow_element_types : list of \
@@ -1186,7 +1196,9 @@ class SubmissionSimilarity(Model):
     similarity = Column(Float, default=0.0)
 
     user_id = Column(Integer, ForeignKey('users.id'))
-    user = relationship('User', backref=backref('submission_similaritys'))
+    user = relationship('User',
+                        backref=backref('submission_similaritys',
+                                        cascade='all, delete-orphan'))
 
     source_submission_id = Column(Integer, ForeignKey('submissions.id'))
     source_submission = relationship(

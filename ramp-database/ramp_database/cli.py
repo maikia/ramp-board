@@ -1,9 +1,12 @@
 from collections import defaultdict
 
 import click
+import os
 import pandas as pd
+import shutil
 
 from ramp_utils import read_config
+from ramp_utils import generate_ramp_config
 
 from .utils import session_scope
 
@@ -48,12 +51,51 @@ def add_user(config, login, password, lastname, firstname, email,
 @click.option("--config", default='config.yml', show_default=True,
               help='Configuration file YAML format containing the database '
               'information')
+@click.option('--login', help="User's login to be removed")
+def delete_user(config, login):
+    """Delete a user which asked to sign-up to RAMP studio."""
+    config = read_config(config)
+    with session_scope(config['sqlalchemy']) as session:
+        user_module.delete_user(session, login)
+
+
+@main.command()
+@click.option("--config", default='config.yml', show_default=True,
+              help='Configuration file YAML format containing the database '
+              'information')
 @click.option('--login', help="User's login to be approved")
 def approve_user(config, login):
     """Approve a user which asked to sign-up to RAMP studio."""
     config = read_config(config)
     with session_scope(config['sqlalchemy']) as session:
         user_module.approve_user(session, login)
+
+
+@main.command()
+@click.option("--config", default='config.yml', show_default=True,
+              help='Configuration file YAML format containing the database '
+              'information')
+@click.option('--login', help="User's login to be made admin")
+def make_user_admin(config, login):
+    """Make a user a RAMP admin."""
+    config = read_config(config)
+    with session_scope(config['sqlalchemy']) as session:
+        user_module.make_user_admin(session, login)
+
+
+@main.command()
+@click.option("--config", default='config.yml', show_default=True,
+              help='Configuration file YAML format containing the database '
+              'information')
+@click.option('--login', help="User's login to be made admin")
+@click.option('--access-level', help="The access level to grant the user."
+              "One of {'asked', 'user', 'admin'}", default='user',
+              show_default=True)
+def set_user_access_level(config, login, access_level):
+    """Change the access level of a RAMP user."""
+    config = read_config(config)
+    with session_scope(config['sqlalchemy']) as session:
+        user_module.set_user_access_level(session, login, access_level)
 
 
 @main.command()
@@ -67,6 +109,19 @@ def sign_up_team(config, event, team):
     config = read_config(config)
     with session_scope(config['sqlalchemy']) as session:
         team_module.sign_up_team(session, event, team)
+
+
+@main.command()
+@click.option("--config", default='config.yml', show_default=True,
+              help='Configuration file YAML format containing the database '
+              'information')
+@click.option('--event', help='Name of the event')
+@click.option('--team', help='Name of the team')
+def delete_event_team(config, event, team):
+    """Delete a link between a user (or team) and a RAMP event."""
+    config = read_config(config)
+    with session_scope(config['sqlalchemy']) as session:
+        team_module.delete_event_team(session, event, team)
 
 
 @main.command()
@@ -135,6 +190,63 @@ def add_submission(config, event, team, submission, path):
     with session_scope(config['sqlalchemy']) as session:
         submission_module.add_submission(session, event, team, submission,
                                          path)
+
+
+@main.command()
+@click.option("--config", default='config.yml', show_default=True,
+              help='Configuration file YAML format containing the database '
+              'information')
+@click.option("--config-event", required=True,
+              help='Path to configuration file YAML format '
+              'containing the database information, eg config.yml')
+@click.option('--dry-run', is_flag=True,
+              help='Emulate the removal without taking action. Basically, '
+              'only the printing information will be shown. The deletion will '
+              'not be done.')
+@click.option('--from-disk', is_flag=True,
+              help='Flag to remove the event folder from the disk as well.')
+@click.option('--force', is_flag=True,
+              help='Flag to force a removal, even from the disk, when an '
+              'event is not in the database.')
+def delete_event(config, config_event, dry_run, from_disk, force):
+    """Delete event."""
+    internal_config = read_config(config)
+    ramp_config = generate_ramp_config(config_event, config)
+    event_name = ramp_config["event_name"]
+
+    with session_scope(internal_config['sqlalchemy']) as session:
+        db_event = event_module.get_event(session, event_name)
+
+        if db_event:
+            if not dry_run:
+                event_module.delete_event(session, event_name)
+            click.echo(
+                '{} was removed from the database'
+                .format(event_name)
+            )
+        if from_disk:
+            if not db_event and not force:
+                err_msg = ('{} event not found in the database. If you want '
+                           'to force removing event files from the disk, add '
+                           'the option "--force".'
+                           .format(event_name))
+                raise click.ClickException(err_msg)
+            for key in ("ramp_submissions_dir", "ramp_predictions_dir",
+                        "ramp_logs_dir"):
+                dir_to_remove = ramp_config[key]
+                if os.path.exists(dir_to_remove):
+                    if not dry_run:
+                        shutil.rmtree(dir_to_remove)
+                    click.echo("Removed directory:\n{}".format(dir_to_remove))
+                else:
+                    click.echo(
+                        "Directory not found. Skip removal for the "
+                        "directory:\n{}".format(dir_to_remove)
+                    )
+            event_dir = os.path.dirname(config_event)
+            if not dry_run:
+                shutil.rmtree(event_dir)
+            click.echo("Removed directory:\n{}".format(event_dir))
 
 
 @main.command()
